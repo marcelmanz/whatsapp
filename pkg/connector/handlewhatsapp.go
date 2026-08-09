@@ -375,7 +375,7 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		return wa.UserLogin.QueueRemoteEvent(&simplevent.Message[revokeNoticeData]{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventMessage,
-				PortalKey:    wa.getPortalKeyByMessageSource(evt.Info.MessageSource),
+				PortalKey:    wa.portalKeyForMessageSource(evt.Info.MessageSource),
 				Sender:       wa.makeEventSender(ctx, evt.Info.Sender),
 				CreatePortal: false,
 				Timestamp:    evt.Info.Timestamp,

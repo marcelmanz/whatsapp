@@ -48,8 +48,7 @@ func (evt *MessageInfoWrapper) ShouldCreatePortal() bool {
 	return true
 }
 
-func (evt *MessageInfoWrapper) GetPortalKey() networkid.PortalKey {
-	ms := evt.Info.MessageSource
+func (wa *WhatsAppClient) portalKeyForMessageSource(ms types.MessageSource) networkid.PortalKey {
 	jid := ms.Chat
 	if ms.IsIncomingBroadcast() {
 		if ms.IsFromMe {
@@ -68,7 +67,11 @@ func (evt *MessageInfoWrapper) GetPortalKey() networkid.PortalKey {
 			jid = ms.RecipientAlt.ToNonAD()
 		}
 	}
-	return evt.wa.makeWAPortalKey(jid)
+	return wa.makeWAPortalKey(jid)
+}
+
+func (evt *MessageInfoWrapper) GetPortalKey() networkid.PortalKey {
+	return evt.wa.portalKeyForMessageSource(evt.Info.MessageSource)
 }
 
 func (evt *MessageInfoWrapper) AddLogContext(c zerolog.Context) zerolog.Context {
