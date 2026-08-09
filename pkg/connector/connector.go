@@ -63,6 +63,9 @@ type WhatsAppConnector struct {
 	stopMediaEditCacheLoop atomic.Pointer[context.CancelFunc]
 
 	unmigratedDMs *exsync.Set[networkid.PortalKey]
+
+	matrixRTCOutboundStartLock    sync.Mutex
+	matrixRTCOutboundStartExpires map[string]time.Time
 }
 
 func init() {
@@ -109,11 +112,17 @@ func (wa *WhatsAppConnector) Init(bridge *bridgev2.Bridge) {
 	}
 	wa.DB = wadb.New(bridge.ID, bridge.DB.Database, bridge.Log.With().Str("db_section", "whatsapp").Logger())
 	wa.MsgConv.DB = wa.DB
+	wa.matrixRTCOutboundStartExpires = make(map[string]time.Time)
 	wa.Bridge.Commands.(*commands.Processor).AddHandlers(
 		cmdAccept, cmdSync, cmdInviteLink, cmdResolveLink, cmdJoin,
+		cmdCallParticipants, cmdCallAdd, cmdCallRing, cmdCallVideoSelect,
+		cmdCallLinkCreate, cmdCallLinkPreview, cmdCallLinkJoin,
+		cmdCallWaiting, cmdCallApproval, cmdCallAdmit, cmdCallDeny,
 	)
 	wa.mediaEditCache = make(MediaEditCache)
 	wa.unmigratedDMs = exsync.NewSet[networkid.PortalKey]()
+	wa.initMatrixRTCEventHooks()
+	wa.startMatrixRTCHealthcheck()
 
 	whatsmeowDBLog := bridge.Log.With().Str("db_section", "whatsmeow").Logger()
 	wa.DeviceStore = sqlstore.NewWithWrappedDB(

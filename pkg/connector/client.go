@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/purpshell/meowcaller"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/whatsmeow"
@@ -40,6 +41,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-whatsapp/pkg/connector/voip"
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
@@ -56,6 +58,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		pushNamesSynced:           exsync.NewEvent(),
 		createDedup:               exsync.NewSet[types.MessageID](),
 		appStateFullSyncAttempted: make(map[appstate.WAPatchName]time.Time),
+		incomingCallGroups:        make(map[string]incomingCallGroup),
 	}
 	login.Client = w
 
@@ -75,7 +78,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 	if w.Device != nil {
 		log := w.UserLogin.Log.With().Str("component", "whatsmeow").Logger()
 		w.Client = whatsmeow.NewClient(w.Device, waLog.Zerolog(log))
-		w.Client.AddEventHandlerWithSuccessStatus(w.handleWAEvent)
+		w.Client.AddEventHandler(w.trackIncomingCallEvent)
 		w.Client.SynchronousAck = true
 		w.Client.EnableDecryptedEventBuffer = bridgev2.PortalEventBuffer == 0
 		w.Client.ManualHistorySyncDownload = true
@@ -84,6 +87,19 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		w.Client.GetMessageForRetry = w.trackNotFoundRetry
 		w.Client.PreRetryCallback = w.trackFoundRetry
 		w.Client.BackgroundEventCtx = w.UserLogin.Log.WithContext(wa.Bridge.BackgroundCtx)
+		w.VOIP = voip.NewManager(w.Client, makeVOIPConfig(wa.Config.VOIP), w.UserLogin.Log.With().Str("component", "voip").Logger())
+		w.VOIP.SetIncomingCallHandler(w.handleIncomingVOIPCall)
+		w.VOIP.SetCallEndHandler(w.handleVOIPCallEnded)
+		w.VOIP.SetCallReactionHandler(func(callID string, reaction meowcaller.CallReaction) {
+			go w.handleWhatsAppCallReaction(withoutCancelOrBackground(w.Main.Bridge.BackgroundCtx), callID, reaction)
+		})
+		w.VOIP.SetHandRaiseHandler(func(callID string, state meowcaller.HandRaiseState) {
+			go w.handleWhatsAppHandRaise(withoutCancelOrBackground(w.Main.Bridge.BackgroundCtx), callID, state)
+		})
+		w.VOIP.SetWaitingRoomHandler(func(callID string, state meowcaller.WaitingRoomState) {
+			go w.handleWhatsAppWaitingRoom(withoutCancelOrBackground(w.Main.Bridge.BackgroundCtx), callID, state)
+		})
+		w.Client.AddEventHandlerWithSuccessStatus(w.handleWAEvent)
 		w.Client.SetForceActiveDeliveryReceipts(wa.Config.ForceActiveDeliveryReceipts)
 		w.Client.InitialAutoReconnect = wa.Config.InitialAutoReconnect
 		w.Client.UseRetryMessageStore = wa.Config.UseWhatsAppRetryStore
@@ -103,24 +119,31 @@ type WhatsAppClient struct {
 	Main      *WhatsAppConnector
 	UserLogin *bridgev2.UserLogin
 	Client    *whatsmeow.Client
+	VOIP      *voip.Manager
 	Device    *store.Device
 	JID       types.JID
 	LID       types.JID
 	MC        mClient
 
-	historySyncWakeup  chan struct{}
-	stopLoops          atomic.Pointer[context.CancelFunc]
-	resyncQueue        map[types.JID]resyncQueueItem
-	resyncQueueLock    sync.Mutex
-	nextResync         time.Time
-	directMediaRetries map[networkid.MessageID]*directMediaRetry
-	directMediaLock    sync.Mutex
-	mediaRetryLock     *semaphore.Weighted
-	offlineSyncWaiter  atomic.Pointer[chan error]
-	isNewLogin         bool
-	pushNamesSynced    *exsync.Event
-	lastPresence       types.Presence
-	createDedup        *exsync.Set[types.MessageID]
+	historySyncWakeup     chan struct{}
+	stopLoops             atomic.Pointer[context.CancelFunc]
+	resyncQueue           map[types.JID]resyncQueueItem
+	resyncQueueLock       sync.Mutex
+	nextResync            time.Time
+	directMediaRetries    map[networkid.MessageID]*directMediaRetry
+	directMediaLock       sync.Mutex
+	voipHandBridgeLock    sync.Mutex
+	voipHandRaiseLock     sync.Mutex
+	voipHandRaises        map[string]map[types.JID]bool
+	voipCallStartLock     sync.Mutex
+	incomingCallGroupLock sync.Mutex
+	incomingCallGroups    map[string]incomingCallGroup
+	mediaRetryLock        *semaphore.Weighted
+	offlineSyncWaiter     atomic.Pointer[chan error]
+	isNewLogin            bool
+	pushNamesSynced       *exsync.Event
+	lastPresence          types.Presence
+	createDedup           *exsync.Set[types.MessageID]
 
 	appStateRecoveryLock      sync.Mutex
 	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
@@ -219,6 +242,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	wa.cleanupStaleMatrixRTCCalls(ctx)
 	wa.initMC()
 	wa.startLoops()
 	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
@@ -377,6 +401,9 @@ func (wa *WhatsAppClient) callStopLoops() {
 
 func (wa *WhatsAppClient) Disconnect() {
 	wa.callStopLoops()
+	if wa.VOIP != nil {
+		wa.VOIP.AbortAll()
+	}
 	if cli := wa.Client; cli != nil {
 		cli.Disconnect()
 	}
