@@ -1,4 +1,4 @@
--- v10 (compatible with v3+): Add MatrixRTC/LiveKit call metadata
+-- v12 (compatible with v3+): Add MatrixRTC/LiveKit call metadata
 CREATE TABLE whatsapp_matrixrtc_call (
     bridge_id               TEXT   NOT NULL,
     user_login_id           TEXT   NOT NULL,
