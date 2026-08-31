@@ -56,9 +56,10 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		directMediaRetries:        make(map[networkid.MessageID]*directMediaRetry),
 		mediaRetryLock:            semaphore.NewWeighted(wa.Config.HistorySync.MediaRequests.MaxAsyncHandle),
 		pushNamesSynced:           exsync.NewEvent(),
-		createDedup:               exsync.NewSet[types.MessageID](),
 		appStateFullSyncAttempted: make(map[appstate.WAPatchName]time.Time),
 		incomingCallGroups:        make(map[string]incomingCallGroup),
+
+		disableNewsletter: store.BaseClientPayload.GetUserAgent().GetPlatform() == waWa6.ClientPayload_UserAgent_MACOS,
 	}
 	login.Client = w
 
@@ -144,6 +145,8 @@ type WhatsAppClient struct {
 	pushNamesSynced       *exsync.Event
 	lastPresence          types.Presence
 	createDedup           *exsync.Set[types.MessageID]
+
+	disableNewsletter bool
 
 	appStateRecoveryLock      sync.Mutex
 	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
@@ -418,6 +421,10 @@ func (wa *WhatsAppClient) LogoutRemote(ctx context.Context) {
 	}
 	wa.Disconnect()
 	wa.Client = nil
+	err := wa.Main.DB.Conversation.DeleteAll(ctx, wa.UserLogin.ID)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to delete history sync data on logout")
+	}
 }
 
 func (wa *WhatsAppClient) IsLoggedIn() bool {

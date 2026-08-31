@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -205,7 +207,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 		wa.notifyOfflineSyncWaiter(nil)
 	case *events.LoggedOut:
-		wa.handleWALogout(evt.Reason, evt.OnConnect)
+		wa.handleWALogout(ctx, evt.Reason, evt.OnConnect)
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("logged out: %s", evt.Reason))
 	case *events.Disconnected:
 		// Don't send the normal transient disconnect state if we're already in a different transient disconnect state.
@@ -288,6 +290,9 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if evt.Info.Chat == types.StatusBroadcastJID && !wa.Main.Config.EnableStatusBroadcast {
 		return
 	}
+	if evt.Info.Chat.Server == types.NewsletterServer && wa.disableNewsletter {
+		return
+	}
 	if !wa.ensureAltJIDs(ctx, &evt.Info.MessageSource, true) {
 		return false
 	}
@@ -341,18 +346,8 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	messageAssoc := evt.Message.GetMessageContextInfo().GetMessageAssociation()
 	if assocType := messageAssoc.GetAssociationType(); assocType == waE2E.MessageAssociation_HD_IMAGE_DUAL_UPLOAD || assocType == waE2E.MessageAssociation_HD_VIDEO_DUAL_UPLOAD {
 		parentKey := messageAssoc.GetParentMessageKey()
-		protocolMsg := evt.Message.GetProtocolMessage()
-		if protocolMsg.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT || protocolMsg.GetKey() == nil {
-			protocolMsg = &waE2E.ProtocolMessage{
-				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
-				Key:           parentKey,
-				EditedMessage: evt.Message.GetAssociatedChildMessage().GetMessage(),
-			}
-			dontRenderEdited = true
-		} else if child := protocolMsg.GetEditedMessage().GetAssociatedChildMessage().GetMessage(); child != nil {
-			protocolMsg.EditedMessage = child
-			protocolMsg.Key = parentKey
-		}
+		protocolMsg, shouldHideEdit := makeHDMediaReplacementEdit(evt.Message, parentKey)
+		dontRenderEdited = shouldHideEdit
 		wa.UserLogin.Log.Debug().
 			Str("message_id", evt.Info.ID).
 			Str("parent_id", parentKey.GetID()).
@@ -427,6 +422,26 @@ func convertRevokeNotice(ctx context.Context, portal *bridgev2.Portal, intent br
 			Content: content,
 		}},
 	}, nil
+}
+
+func makeHDMediaReplacementEdit(message *waE2E.Message, parentKey *waCommon.MessageKey) (*waE2E.ProtocolMessage, bool) {
+	protocolMsg := message.GetProtocolMessage()
+	associatedMessage := message.GetAssociatedChildMessage().GetMessage()
+	if protocolMsg.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT || protocolMsg.GetKey() == nil {
+		protocolMsg = associatedMessage.GetProtocolMessage()
+	}
+	if protocolMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT && protocolMsg.GetKey() != nil {
+		if child := protocolMsg.GetEditedMessage().GetAssociatedChildMessage().GetMessage(); child != nil {
+			protocolMsg.EditedMessage = child
+		}
+		protocolMsg.Key = parentKey
+		return protocolMsg, false
+	}
+	return &waE2E.ProtocolMessage{
+		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		Key:           parentKey,
+		EditedMessage: associatedMessage,
+	}, true
 }
 
 func (wa *WhatsAppClient) handleWAUndecryptableMessage(ctx context.Context, evt *events.UndecryptableMessage) bool {
@@ -508,6 +523,8 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	messageSender := wa.GetLID()
 	if !evt.MessageSender.IsEmpty() {
 		messageSender = evt.MessageSender
+	} else if evt.Chat.Server == types.NewsletterServer {
+		messageSender = evt.Chat
 	}
 	var chatAlt types.JID
 	if evt.Chat.Server == types.DefaultUserServer {
@@ -526,6 +543,8 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	senderLID := evt.Sender
 	if senderLID.Server == types.DefaultUserServer && !evt.SenderAlt.IsEmpty() {
 		senderLID = evt.SenderAlt
+	} else if evt.Chat.Server == types.NewsletterServer && evt.Type == types.ReceiptTypeReadSelf {
+		senderLID = wa.GetLID()
 	}
 	res := wa.UserLogin.QueueRemoteEvent(&simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
@@ -533,6 +552,11 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 			PortalKey: wa.makeWAPortalKey(evt.Chat),
 			Sender:    wa.makeEventSender(ctx, senderLID),
 			Timestamp: evt.Timestamp,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.
+					Strs("targets", exslices.CastToString[string](targets)).
+					Stringer("receipt_sender", senderLID)
+			},
 		},
 		Targets: targets,
 	})
@@ -571,7 +595,7 @@ func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.
 	})
 }
 
-func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onConnect bool) {
+func (wa *WhatsAppClient) handleWALogout(ctx context.Context, reason events.ConnectFailureReason, onConnect bool) {
 	errorCode := WAUnknownLogout
 	if reason == events.ConnectFailureLoggedOut {
 		errorCode = WALoggedOut
@@ -583,6 +607,10 @@ func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onC
 	wa.JID = types.EmptyJID
 	wa.LID = types.EmptyJID
 	wa.UserLogin.Metadata.(*waid.UserLoginMetadata).WADeviceID = 0
+	err := wa.Main.DB.Conversation.DeleteAll(ctx, wa.UserLogin.ID)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to delete history sync data on logout")
+	}
 	wa.UserLogin.BridgeState.Send(status.BridgeState{
 		StateEvent: status.StateBadCredentials,
 		Error:      errorCode,
@@ -813,9 +841,6 @@ func (wa *WhatsAppClient) handleWAGroupInfoChange(ctx context.Context, evt *even
 }
 
 func (wa *WhatsAppClient) handleWAJoinedGroup(ctx context.Context, evt *events.JoinedGroup) bool {
-	if wa.createDedup.Pop(evt.CreateKey) {
-		return true
-	}
 	return wa.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -828,6 +853,9 @@ func (wa *WhatsAppClient) handleWAJoinedGroup(ctx context.Context, evt *events.J
 }
 
 func (wa *WhatsAppClient) handleWANewsletterJoin(ctx context.Context, evt *events.NewsletterJoin) bool {
+	if wa.disableNewsletter {
+		return true
+	}
 	return wa.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
